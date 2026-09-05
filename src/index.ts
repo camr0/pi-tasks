@@ -32,7 +32,7 @@ import { TaskStore } from "./task-store.js";
 import { loadGlobalTasksConfig, loadTasksConfig } from "./tasks-config.js";
 import type { Task } from "./types.js";
 import { openSettingsMenu } from "./ui/settings-menu.js";
-import { TaskWidget, type UICtx } from "./ui/task-widget.js";
+import { TaskWidget, type TaskWidgetSnapshot, type UICtx } from "./ui/task-widget.js";
 
 // ---- Debug ----
 
@@ -168,6 +168,33 @@ export default function (pi: ExtensionAPI) {
   /** Maps agent IDs to task IDs for O(1) completion lookup. */
   const agentTaskMap = new Map<string, string>();
 
+  // ── Busy signal (drives which task shows its spinner) ──
+  /** Main agent run is actively generating (between agent_start and agent_settled). */
+  let mainRunActive = false;
+  /** Subagent IDs currently running (add on subagents:started, drop on completions). */
+  const runningSubagents = new Set<string>();
+
+  /** Recompute the widget's busy flag whenever the run or subagent set changes. */
+  function updateBusy() {
+    widget.setBusy(mainRunActive || runningSubagents.size > 0 || agentTaskMap.size > 0);
+  }
+
+  pi.on("agent_start", () => {
+    mainRunActive = true;
+    updateBusy();
+  });
+  pi.on("agent_settled", async () => {
+    mainRunActive = false;
+    updateBusy();
+  });
+
+  pi.events.on("subagents:started", (raw: unknown) => {
+    const id = (raw as { id?: string })?.id;
+    if (!id) return;
+    runningSubagents.add(id);
+    updateBusy();
+  });
+
   // ── Subagent RPC helpers ──
 
   /** RPC reply envelope — matches pi-mono's RpcResponse shape. */
@@ -242,6 +269,26 @@ export default function (pi: ExtensionAPI) {
   checkSubagentsVersion();
   pi.events.on("subagents:ready", () => checkSubagentsVersion());
 
+  // ── Task-state RPC (consumed by @tintinweb/pi-subagents' viewer overlay) ──
+  // Serve a serializable snapshot of the live task list so the subagent viewer
+  // can render it even though the widget itself lives in the main editor area
+  // and is hidden behind the fullscreen overlay. Uses the same per-request
+  // scoped reply envelope as the subagents RPC.
+  pi.events.on("tasks:rpc:state", (raw: unknown) => {
+    const params = raw as { requestId?: string };
+    if (!params.requestId) return;
+    try {
+      const reply: RpcReply<TaskWidgetSnapshot> = { success: true, data: widget.snapshot() };
+      pi.events.emit(`tasks:rpc:state:reply:${params.requestId}`, reply);
+    } catch (err: any) {
+      const reply: RpcReply<TaskWidgetSnapshot> = {
+        success: false,
+        error: err?.message ?? String(err),
+      };
+      pi.events.emit(`tasks:rpc:state:reply:${params.requestId}`, reply);
+    }
+  });
+
   /** Build a prompt for a task being executed by a subagent.
    *  Injects completed dependency results so cascaded agents have context from prerequisites.
    */
@@ -281,11 +328,18 @@ export default function (pi: ExtensionAPI) {
   // Success → mark task completed, cascade if enabled
   pi.events.on("subagents:completed", async (data) => {
     const { id, result } = data as { id: string; result?: string };
+    runningSubagents.delete(id);
     const taskId = agentTaskMap.get(id);
-    if (!taskId) return;
+    if (!taskId) {
+      updateBusy();
+      return;
+    }
     agentTaskMap.delete(id);
     const task = store.get(taskId);
-    if (!task) return;
+    if (!task) {
+      updateBusy();
+      return;
+    }
 
     store.update(task.id, { status: "completed", metadata: { ...task.metadata, result } });
     widget.setActiveTask(task.id, false);
@@ -311,6 +365,7 @@ export default function (pi: ExtensionAPI) {
           agentTaskMap.set(agentId, next.id);
           store.update(next.id, { owner: agentId, metadata: { ...next.metadata, agentId } });
           widget.setActiveTask(next.id);
+          updateBusy();
         } catch (err: any) {
           store.update(next.id, { status: "pending", metadata: { ...next.metadata, lastError: err.message } });
         }
@@ -318,17 +373,25 @@ export default function (pi: ExtensionAPI) {
     }
     autoClear.trackCompletion(task.id, cadence.currentTurn);
     widget.update();
+    updateBusy();
   });
 
   // Failure → store error, revert to pending, don't cascade (branch stops)
   // Intentional stop (status === "stopped") → mark completed, preserve partial result
   pi.events.on("subagents:failed", (data) => {
     const { id, error, result, status } = data as { id: string; error?: string; result?: string; status: string };
+    runningSubagents.delete(id);
     const taskId = agentTaskMap.get(id);
-    if (!taskId) return;
+    if (!taskId) {
+      updateBusy();
+      return;
+    }
     agentTaskMap.delete(id);
     const task = store.get(taskId);
-    if (!task) return;
+    if (!task) {
+      updateBusy();
+      return;
+    }
 
     if (status === "stopped") {
       // Intentional stop — mark completed, preserve partial result
@@ -341,6 +404,7 @@ export default function (pi: ExtensionAPI) {
     }
     widget.setActiveTask(task.id, false);
     widget.update();
+    updateBusy();
   });
 
   // ── Context-scoped store initialization ──
@@ -395,8 +459,10 @@ export default function (pi: ExtensionAPI) {
       const agentId = task.metadata?.agentId;
       if (task.status === "in_progress" && typeof agentId === "string" && agentId) {
         agentTaskMap.set(agentId, task.id);
+        runningSubagents.add(agentId);
       }
     }
+    updateBusy();
   }
 
   /** Restore widget on session start/resume if there's unfinished work.
@@ -1142,6 +1208,7 @@ Set up task dependencies:
           agentTaskMap.set(agentId, taskId);
           store.update(taskId, { owner: agentId, metadata: { ...task.metadata, agentId } });
           widget.setActiveTask(taskId);
+          updateBusy();
           launched.push(`#${taskId} → agent ${agentId}`);
         } catch (err: any) {
           debug(`spawn:error task=#${taskId}`, err);

@@ -1020,6 +1020,7 @@ describe("Widget agent ID display", () => {
     store.create("Agent task", "Desc", "Running tests", { agentType: "general-purpose", agentId: "abc1234567890" });
     store.update("1", { status: "in_progress" });
     widget.setActiveTask("1", true);
+    widget.setBusy(true);
 
     const lines = renderWidget(ui.state);
     expect(lines[1]).toContain("agent abc12");

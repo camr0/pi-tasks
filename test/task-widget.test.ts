@@ -103,6 +103,7 @@ describe("TaskWidget", () => {
     store.create("Running thing", "Desc", "Processing data");
     store.update("1", { status: "in_progress" });
     widget.setActiveTask("1", true);
+    widget.setBusy(true);
 
     const lines = renderWidget(ui.state);
     // Should show activeForm text with "…" suffix
@@ -441,6 +442,7 @@ describe("TaskWidget", () => {
     store.create("Active task", "Desc", "Running");
     store.update("1", { status: "in_progress" });
     widget.setActiveTask("1", true);
+    widget.setBusy(true);
 
     widget.addTokenUsage(1000, 500);
     widget.addTokenUsage(500, 300);
@@ -455,6 +457,7 @@ describe("TaskWidget", () => {
     store.create("Task", "Desc", "Doing work");
     store.update("1", { status: "in_progress" });
     widget.setActiveTask("1", true);
+    widget.setBusy(true);
 
     // Should be active (spinner)
     let lines = renderWidget(ui.state);
@@ -489,6 +492,7 @@ describe("TaskWidget", () => {
     store.update("2", { status: "in_progress" });
     widget.setActiveTask("1", true);
     widget.setActiveTask("2", true);
+    widget.setBusy(true);
 
     const lines = renderWidget(ui.state);
     expect(lines[1]).toContain("Processing A…");
@@ -502,6 +506,7 @@ describe("TaskWidget", () => {
     store.update("2", { status: "in_progress" });
     widget.setActiveTask("1", true);
     widget.setActiveTask("2", true);
+    widget.setBusy(true);
 
     widget.addTokenUsage(100, 50);
 
@@ -524,6 +529,7 @@ describe("TaskWidget", () => {
     store.create("My Subject", "Desc");
     store.update("1", { status: "in_progress" });
     widget.setActiveTask("1", true);
+    widget.setBusy(true);
 
     const lines = renderWidget(ui.state);
     expect(lines[1]).toContain("My Subject…");
@@ -533,6 +539,7 @@ describe("TaskWidget", () => {
     store.create("No tokens", "Desc", "Working");
     store.update("1", { status: "in_progress" });
     widget.setActiveTask("1", true);
+    widget.setBusy(true);
 
     // No addTokenUsage calls — tokens stay at 0
     vi.advanceTimersByTime(5000);
@@ -581,6 +588,48 @@ describe("TaskWidget", () => {
     const entry = ui.state.widgets.get("tasks");
     expect(entry?.options?.placement).toBe("aboveEditor");
   });
+
+  describe("snapshot()", () => {
+    it("serializes the task list in id order with status", () => {
+      store.create("Done", "D");
+      store.create("Run", "D", "Working");
+      store.create("Open", "D");
+      store.update("1", { status: "completed" });
+      store.update("2", { status: "in_progress" });
+      const snap = widget.snapshot();
+      expect(snap.tasks).toHaveLength(3);
+      expect(snap.tasks.map(t => t.id)).toEqual(["1", "2", "3"]);
+      expect(snap.tasks[0].status).toBe("completed");
+      expect(snap.tasks[1].status).toBe("in_progress");
+    });
+
+    it("marks the active in_progress task and reports busy state", () => {
+      store.create("Run", "D", "Working");
+      store.update("1", { status: "in_progress" });
+      widget.setActiveTask("1", true);
+      widget.setBusy(true);
+
+      const snap = widget.snapshot();
+      expect(snap.busy).toBe(true);
+      expect(snap.tasks[0].active).toBe(true);
+    });
+
+    it("freezes elapsedMs while idle but keeps accumulated busy time", () => {
+      store.create("Run", "D", "Working");
+      store.update("1", { status: "in_progress" });
+      widget.setActiveTask("1", true);
+
+      // Busy for 30s, then idle for 1h — the timer must stay near 30s.
+      widget.setBusy(true);
+      vi.advanceTimersByTime(30_000);
+      widget.setBusy(false);
+      vi.advanceTimersByTime(3_600_000);
+
+      const snap = widget.snapshot();
+      expect(snap.tasks[0].elapsedMs).toBeGreaterThanOrEqual(29_500);
+      expect(snap.tasks[0].elapsedMs).toBeLessThan(60_000);
+    });
+  });
 });
 
 describe("formatDuration (via widget rendering)", () => {
@@ -605,6 +654,7 @@ describe("formatDuration (via widget rendering)", () => {
     store.create("Quick", "Desc", "Working");
     store.update("1", { status: "in_progress" });
     widget.setActiveTask("1", true);
+    widget.setBusy(true);
 
     vi.advanceTimersByTime(30_000); // 30s
     widget.update();
@@ -617,6 +667,7 @@ describe("formatDuration (via widget rendering)", () => {
     store.create("Long", "Desc", "Working");
     store.update("1", { status: "in_progress" });
     widget.setActiveTask("1", true);
+    widget.setBusy(true);
 
     vi.advanceTimersByTime(3_723_000); // 1h 2m 3s → "1h 2m"
     widget.update();
@@ -629,6 +680,7 @@ describe("formatDuration (via widget rendering)", () => {
     store.create("Exact", "Desc", "Working");
     store.update("1", { status: "in_progress" });
     widget.setActiveTask("1", true);
+    widget.setBusy(true);
 
     vi.advanceTimersByTime(7_200_000); // 2h exactly
     widget.update();
@@ -641,6 +693,7 @@ describe("formatDuration (via widget rendering)", () => {
     store.create("Medium", "Desc", "Working");
     store.update("1", { status: "in_progress" });
     widget.setActiveTask("1", true);
+    widget.setBusy(true);
 
     vi.advanceTimersByTime(169_000); // 2m 49s
     widget.update();
@@ -700,7 +753,8 @@ describe("spinner animation timing", () => {
   /** The spinner glyph is the first non-space character of the task line. */
   const glyph = () => renderWidget(ui.state)[1].trim().split(" ")[0];
 
-  it("advances one frame per timer tick", () => {
+  it("advances one frame per timer tick while busy", () => {
+    widget.setBusy(true);
     const frames = [glyph()];
     for (let i = 0; i < 3; i++) {
       vi.advanceTimersByTime(150);
@@ -710,10 +764,17 @@ describe("spinner animation timing", () => {
     expect(new Set(frames).size).toBe(4);
   });
 
+  it("does not animate when idle (no busy signal)", () => {
+    // With the spinner gated on the busy signal, an in_progress task that is
+    // not currently being worked shows a frozen ◼ instead of a live spinner.
+    expect(glyph()).toBe("◼");
+  });
+
   it("does not advance when task activity redraws the widget", () => {
     // update() runs on every task mutation and on tool execution. Advancing the
     // frame there tied animation speed to how busy the agent was, so the spinner
     // raced ahead during bursts and stalled when nothing happened.
+    widget.setBusy(true);
     const before = glyph();
     for (let i = 0; i < 5; i++) widget.update();
 
@@ -721,10 +782,19 @@ describe("spinner animation timing", () => {
   });
 
   it("still animates after an unrelated redraw", () => {
+    widget.setBusy(true);
     widget.update();
     const before = glyph();
     vi.advanceTimersByTime(150);
 
     expect(glyph()).not.toBe(before);
+  });
+
+  it("freezes to ◼ when busy clears", () => {
+    widget.setBusy(true);
+    vi.advanceTimersByTime(300);
+    expect(glyph()).not.toBe("◼");
+    widget.setBusy(false);
+    expect(glyph()).toBe("◼");
   });
 });

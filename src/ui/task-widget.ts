@@ -50,11 +50,43 @@ const SPINNER = ["✳", "✴", "✵", "✶", "✷", "✸", "✹", "✺", "✻", 
 
 const DEFAULT_MAX_VISIBLE_TASKS = 10;
 
-/** Per-task runtime metrics (elapsed time, token usage). */
+/** Per-task runtime metrics (elapsed time, token usage).
+ *
+ * `activeMs` accumulates busy wall-clock time; `busySince` marks the moment the
+ * most recent busy window started (undefined while idle). Elapsed for display is
+ * `activeMs + (busySince !== undefined ? now - busySince : 0)` — so the timer
+ * freezes whenever nothing is actually running. */
 export interface TaskMetrics {
-  startedAt: number;
+  activeMs: number;
+  busySince: number | undefined;
   inputTokens: number;
   outputTokens: number;
+}
+
+/** One task in a TaskWidgetSnapshot, serialized for cross-extension consumers. */
+export interface TaskWidgetSnapshotTask {
+  id: string;
+  subject: string;
+  description: string;
+  status: string;
+  activeForm?: string;
+  owner?: string;
+  agentId?: string;
+  blocks: string[];
+  blockedBy: string[];
+  /** Whether this task is the active (spinner) one right now, regardless of busy. */
+  active: boolean;
+  /** Frozen-aware elapsed ms — already settled to activeMs when idle. */
+  elapsedMs: number;
+  inputTokens: number;
+  outputTokens: number;
+}
+
+/** Live, serializable task-list state for cross-extension consumers. */
+export interface TaskWidgetSnapshot {
+  /** Whether anything is running (main run or subagent). */
+  busy: boolean;
+  tasks: TaskWidgetSnapshotTask[];
 }
 
 /** Format milliseconds as a human-readable duration (e.g., "2m 49s", "1h 3m"). */
@@ -89,6 +121,9 @@ export class TaskWidget {
   private tui: any | undefined;
   /** Whether the widget callback is currently registered. */
   private widgetRegistered = false;
+  /** Whether anything is actually running right now (main run or any subagent).
+   *  When this is false the spinner/timer pause even for in_progress tasks. */
+  private busy = false;
 
   constructor(
     private store: TaskStore,
@@ -103,12 +138,22 @@ export class TaskWidget {
     this.uiCtx = ctx;
   }
 
+  /** Report whether anything is running (drives animation + timer freezing). */
+  get isBusy(): boolean {
+    return this.busy;
+  }
+
   /** Add or remove a task from the active spinner set. */
   setActiveTask(taskId: string | undefined, active = true) {
     if (taskId && active) {
       this.activeTaskIds.add(taskId);
       if (!this.metrics.has(taskId)) {
-        this.metrics.set(taskId, { startedAt: Date.now(), inputTokens: 0, outputTokens: 0 });
+        this.metrics.set(taskId, {
+          activeMs: 0,
+          busySince: this.busy ? Date.now() : undefined,
+          inputTokens: 0,
+          outputTokens: 0,
+        });
       }
       this.ensureTimer();
     } else if (taskId) {
@@ -117,7 +162,32 @@ export class TaskWidget {
     this.update();
   }
 
-  /** Record token usage for the currently active task(s). */
+  /** Flip the busy signal. Idle → busy starts the elapsed window for every
+   *  active task; busy → idle freezes it (accumulate into activeMs, clear
+   *  busySince) so the timer stops climbing while nothing is running. */
+  setBusy(busy: boolean) {
+    if (busy === this.busy) return;
+    const now = Date.now();
+    if (busy) {
+      for (const id of this.activeTaskIds) {
+        const m = this.metrics.get(id);
+        if (m && m.busySince === undefined) m.busySince = now;
+      }
+    } else {
+      for (const id of this.activeTaskIds) {
+        const m = this.metrics.get(id);
+        if (m && m.busySince !== undefined) {
+          m.activeMs += now - m.busySince;
+          m.busySince = undefined;
+        }
+      }
+    }
+    this.busy = busy;
+    this.update();
+  }
+
+  /** Record token usage for the currently active task(s). Tokens accrue across
+   *  busy windows (they reflect model output, not wall-clock time). */
   addTokenUsage(inputTokens: number, outputTokens: number) {
     // Distribute to all currently active tasks
     for (const id of this.activeTaskIds) {
@@ -195,10 +265,15 @@ export class TaskWidget {
     }
     for (let i = 0; i < visible.length; i++) {
       const task = visible[i];
-      const isActive = this.activeTaskIds.has(task.id) && task.status === "in_progress";
+      // Spinner only while something is actually running. An in_progress task
+      // with a stale active marker (LLM settled, no subagents) renders as a
+      // static ◼ with a frozen elapsed time instead of an animate spinner.
+      const inActiveSet = this.activeTaskIds.has(task.id);
+      const isActive = inActiveSet && task.status === "in_progress";
+      const isAnimating = isActive && this.busy;
 
       let icon: string;
-      if (isActive) {
+      if (isAnimating) {
         icon = theme.fg("accent", spinnerChar);
       } else if (task.status === "completed") {
         icon = theme.fg("success", "✔");
@@ -219,30 +294,37 @@ export class TaskWidget {
         }
       }
 
+      // Build an optional ` (elapsed · tokens)` stats suffix from the task's
+      // metrics. Elapsed is frozen when idle (activeMs settles, no busySince
+      // window open) and live when animating.
+      const statsFor = (m: TaskMetrics | undefined): string => {
+        if (!m) return "";
+        const elapsed = formatDuration(this.elapsedFor(m));
+        const tokenParts: string[] = [];
+        if (m.inputTokens > 0) tokenParts.push(`↑ ${formatTokens(m.inputTokens)}`);
+        if (m.outputTokens > 0) tokenParts.push(`↓ ${formatTokens(m.outputTokens)}`);
+        return tokenParts.length > 0
+          ? ` ${theme.fg("dim", `(${elapsed} · ${tokenParts.join(" ")})`)}`
+          : ` ${theme.fg("dim", `(${elapsed})`)}`;
+      };
+
       let text: string;
-      if (isActive) {
+      if (isAnimating) {
         const form = task.activeForm || task.subject;
         const agentId = task.metadata?.agentId;
         const agentLabel = agentId ? ` (agent ${agentId.slice(0, 5)})` : "";
-        const m = this.metrics.get(task.id);
-        let stats = "";
-        if (m) {
-          const elapsed = formatDuration(Date.now() - m.startedAt);
-          const tokenParts: string[] = [];
-          if (m.inputTokens > 0) tokenParts.push(`↑ ${formatTokens(m.inputTokens)}`);
-          if (m.outputTokens > 0) tokenParts.push(`↓ ${formatTokens(m.outputTokens)}`);
-          stats = tokenParts.length > 0
-            ? ` ${theme.fg("dim", `(${elapsed} · ${tokenParts.join(" ")})`)}`
-            : ` ${theme.fg("dim", `(${elapsed})`)}`;
-        }
-        text = `  ${icon} ${theme.fg("dim", "#" + task.id)} ${theme.fg("accent", form + agentLabel + "…")}${stats}`;
+        text = `  ${icon} ${theme.fg("dim", "#" + task.id)} ${theme.fg("accent", form + agentLabel + "…")}${statsFor(this.metrics.get(task.id))}`;
       } else if (task.status === "completed") {
         text = `  ${icon} ${theme.fg("dim", theme.strikethrough("#" + task.id + " " + task.subject))}`;
-      } else {
-        const agentSuffix = task.status === "in_progress" && task.metadata?.agentId
+      } else if (task.status === "in_progress") {
+        // Non-animated in_progress: keep the subject, attach a frozen stats
+        // suffix when the task had been actively worked on (has metrics).
+        const agentSuffix = task.metadata?.agentId
           ? theme.fg("dim", ` (agent ${task.metadata.agentId.slice(0, 5)})`)
           : "";
-        text = `  ${icon} ${theme.fg("dim", "#" + task.id)} ${task.subject}${agentSuffix}`;
+        text = `  ${icon} ${theme.fg("dim", "#" + task.id)} ${task.subject}${agentSuffix}${statsFor(this.metrics.get(task.id))}`;
+      } else {
+        text = `  ${icon} ${theme.fg("dim", "#" + task.id)} ${task.subject}`;
       }
 
       lines.push(truncate(text + suffix));
@@ -256,6 +338,40 @@ export class TaskWidget {
     }
 
     return lines;
+  }
+
+  /** Elapsed ms for an active task — frozen while idle, live while busy. */
+  private elapsedFor(m: TaskMetrics): number {
+    return m.activeMs + (m.busySince !== undefined ? Date.now() - m.busySince : 0);
+  }
+
+  /** Serializable snapshot for cross-extension consumers (e.g. the pi-subagents
+   *  viewer). Mirrors the widget's live list, but structured so a caller can
+   *  render tasks with its own theme/width. `index.ts` answers the
+   *  `tasks:rpc:state` request with this. */
+  snapshot(): TaskWidgetSnapshot {
+    const tasks = this.store.list(this.config.sortOrder ?? "id");
+    return {
+      busy: this.busy,
+      tasks: tasks.map(t => {
+        const m = this.metrics.get(t.id);
+        return {
+          id: t.id,
+          subject: t.subject,
+          description: t.description,
+          status: t.status,
+          activeForm: t.activeForm,
+          owner: t.owner,
+          agentId: typeof t.metadata?.agentId === "string" ? t.metadata.agentId : undefined,
+          blocks: t.blocks,
+          blockedBy: t.blockedBy,
+          active: this.activeTaskIds.has(t.id) && t.status === "in_progress",
+          elapsedMs: m ? this.elapsedFor(m) : 0,
+          inputTokens: m?.inputTokens ?? 0,
+          outputTokens: m?.outputTokens ?? 0,
+        };
+      }),
+    };
   }
 
   /** Force an immediate widget update. */
@@ -285,8 +401,9 @@ export class TaskWidget {
       }
     }
 
-    // Check if any task needs animation
-    const hasActiveSpinner = tasks.some(t => this.activeTaskIds.has(t.id) && t.status === "in_progress");
+    // Only animate (spinner + advancing timer) while something is actually
+    // running. Idle tasks stop the 150ms re-render loop entirely.
+    const hasActiveSpinner = this.busy && tasks.some(t => this.activeTaskIds.has(t.id) && t.status === "in_progress");
     if (hasActiveSpinner) {
       this.ensureTimer();
     } else if (!hasActiveSpinner && this.widgetInterval) {
