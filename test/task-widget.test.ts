@@ -1,3 +1,4 @@
+import { visibleWidth } from "@earendil-works/pi-tui";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TaskStore } from "../src/task-store.js";
 import { TaskWidget, type Theme, type UICtx } from "../src/ui/task-widget.js";
@@ -34,11 +35,11 @@ function mockUICtx() {
 }
 
 /** Render the widget and return its lines. */
-function renderWidget(state: ReturnType<typeof mockUICtx>["state"]): string[] {
+function renderWidget(state: ReturnType<typeof mockUICtx>["state"], columns = 200): string[] {
   const entry = state.widgets.get("tasks");
   if (!entry?.content) return [];
   const theme = mockTheme();
-  const tui = { terminal: { columns: 200 }, requestRender() {} };
+  const tui = { terminal: { columns }, requestRender() {} };
   const result = entry.content(tui, theme);
   return result.render();
 }
@@ -106,10 +107,36 @@ describe("TaskWidget", () => {
     widget.setBusy(true);
 
     const lines = renderWidget(ui.state);
-    // Should show activeForm text with "…" suffix
-    expect(lines[1]).toContain("Processing data…");
+    expect(lines[1]).toContain("Processing data");
     // Should NOT show ◼ for active task
     expect(lines[1]).not.toContain("◼");
+  });
+
+  it("shows the complete activeForm when the line fits — no decorative ellipsis", () => {
+    store.create("M4: Agent serving integration (Tasks 26–31)", "Desc", "Executing M4 agent integration");
+    store.update("1", { status: "in_progress" });
+    widget.setActiveTask("1", true);
+    widget.setBusy(true);
+
+    const lines = renderWidget(ui.state); // 200 columns: plenty of room
+    expect(lines[1]).toContain("Executing M4 agent integration");
+    // A trailing "…" here reads as a truncation that never happened.
+    expect(lines[1]).not.toContain("Executing M4 agent integration…");
+  });
+
+  it("still ellipsizes the active line when it genuinely exceeds the width", () => {
+    store.create(
+      "Long",
+      "Desc",
+      "Executing a very long running operation that cannot possibly fit in forty columns",
+    );
+    store.update("1", { status: "in_progress" });
+    widget.setActiveTask("1", true);
+    widget.setBusy(true);
+
+    const lines = renderWidget(ui.state, 40);
+    expect(lines[1]).toContain("...");
+    expect(visibleWidth(lines[1])).toBeLessThanOrEqual(40);
   });
 
   it("shows blocked-by info for pending tasks", () => {
@@ -448,7 +475,7 @@ describe("TaskWidget", () => {
     widget.addTokenUsage(500, 300);
 
     const lines = renderWidget(ui.state);
-    const activeLine = lines.find(l => l.includes("Running…"));
+    const activeLine = lines.find(l => l.includes("Running"));
     expect(activeLine).toContain("↑ 1.5k");
     expect(activeLine).toContain("↓ 800");
   });
@@ -459,15 +486,17 @@ describe("TaskWidget", () => {
     widget.setActiveTask("1", true);
     widget.setBusy(true);
 
-    // Should be active (spinner)
+    // Should be active (spinner + activeForm label)
     let lines = renderWidget(ui.state);
-    expect(lines[1]).toContain("Doing work…");
+    expect(lines[1]).toContain("✳");
+    expect(lines[1]).toContain("Doing work");
 
     widget.setActiveTask("1", false);
     lines = renderWidget(ui.state);
-    // Should now show as regular in_progress (◼)
+    // Should now show as regular in_progress (◼) with the subject, not the activeForm
     expect(lines[1]).toContain("◼");
-    expect(lines[1]).not.toContain("Doing work…");
+    expect(lines[1]).toContain("Task");
+    expect(lines[1]).not.toContain("Doing work");
   });
 
   it("prunes stale active IDs on update", () => {
@@ -495,8 +524,8 @@ describe("TaskWidget", () => {
     widget.setBusy(true);
 
     const lines = renderWidget(ui.state);
-    expect(lines[1]).toContain("Processing A…");
-    expect(lines[2]).toContain("Processing B…");
+    expect(lines[1]).toContain("Processing A");
+    expect(lines[2]).toContain("Processing B");
   });
 
   it("distributes token usage across all active tasks", () => {
@@ -532,7 +561,7 @@ describe("TaskWidget", () => {
     widget.setBusy(true);
 
     const lines = renderWidget(ui.state);
-    expect(lines[1]).toContain("My Subject…");
+    expect(lines[1]).toContain("My Subject");
   });
 
   it("shows elapsed time but no token arrows when tokens are zero", () => {
@@ -546,7 +575,7 @@ describe("TaskWidget", () => {
     widget.update();
 
     const lines = renderWidget(ui.state);
-    const activeLine = lines.find(l => l.includes("Working…"));
+    const activeLine = lines.find(l => l.includes("Working"));
     expect(activeLine).toContain("5s");
     expect(activeLine).not.toContain("↑");
     expect(activeLine).not.toContain("↓");

@@ -313,7 +313,11 @@ export class TaskWidget {
         const form = task.activeForm || task.subject;
         const agentId = task.metadata?.agentId;
         const agentLabel = agentId ? ` (agent ${agentId.slice(0, 5)})` : "";
-        text = `  ${icon} ${theme.fg("dim", "#" + task.id)} ${theme.fg("accent", form + agentLabel + "…")}${statsFor(this.metrics.get(task.id))}`;
+        // No decorative trailing "…": the spinner glyph and accent colour already
+        // mark the task as running, and an unconditional ellipsis made complete
+        // titles read as truncated. `truncate` below appends a real one only when
+        // the line genuinely exceeds the terminal width.
+        text = `  ${icon} ${theme.fg("dim", "#" + task.id)} ${theme.fg("accent", form + agentLabel)}${statsFor(this.metrics.get(task.id))}`;
       } else if (task.status === "completed") {
         text = `  ${icon} ${theme.fg("dim", theme.strikethrough("#" + task.id + " " + task.subject))}`;
       } else if (task.status === "in_progress") {
